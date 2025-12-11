@@ -31,6 +31,7 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+    use_imaginary: bool = False # RoPE++: use imaginary component for half the heads
 
 
 def norm(x):
@@ -48,6 +49,18 @@ def apply_rotary_emb(x, cos, sin):
     out = out.to(x.dtype) # ensure input/output dtypes match
     return out
 
+
+def apply_rotary_emb_imaginary(x, cos, sin):
+    """RoPE++ imaginary component: equivalent to x * sin - rotate_half(x) * cos"""
+    assert x.ndim == 4  # multihead attention
+    d = x.shape[3] // 2
+    x1, x2 = x[..., :d], x[..., d:] # split up last dim into two halves
+    y1 = x1 * sin + x2 * (-cos)
+    y2 = x1 * cos + x2 * sin
+    out = torch.cat([y1, y2], 3) # re-assemble
+    out = out.to(x.dtype) # ensure input/output dtypes match
+    return out
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -56,6 +69,7 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
+        self.use_imaginary = config.use_imaginary
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
         self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
@@ -73,7 +87,18 @@ class CausalSelfAttention(nn.Module):
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
+        
+        # RoPE++: Apply different rotations to first/second half of query heads
+        if self.use_imaginary:
+            half_heads = self.n_head // 2
+            q_first_half = apply_rotary_emb(q[:, :, :half_heads, :], cos, sin)
+            q_second_half = apply_rotary_emb_imaginary(q[:, :, half_heads:, :], cos, sin)
+            q = torch.cat([q_first_half, q_second_half], dim=2)
+        else:
+            q = apply_rotary_emb(q, cos, sin)
+        
+        k = apply_rotary_emb(k, cos, sin)
+        
         q, k = norm(q), norm(k) # QK norm
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
 
