@@ -224,6 +224,7 @@ while True:
                     "n_head": model.config.n_head,
                     "n_kv_head": model.config.n_kv_head,
                     "n_embd": model.config.n_embd,
+                    "use_imaginary": model.config.use_imaginary,
                 },
                 "user_config": user_config, # inputs to the training script
             }
