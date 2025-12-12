@@ -31,7 +31,7 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
-    use_imaginary: bool = False # RoPE++: use imaginary component for half the heads
+    use_imaginary: str = "split" # RoPE++: "none" (standard), "split" (imaginary for half heads), "double" (stack both variants)
 
 
 def norm(x):
@@ -75,7 +75,9 @@ class CausalSelfAttention(nn.Module):
         self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        # In double mode, c_proj takes 2*n_embd input (doubled heads) but outputs n_embd
+        c_proj_in = 2 * self.n_embd if self.use_imaginary == "double" else self.n_embd
+        self.c_proj = nn.Linear(c_proj_in, self.n_embd, bias=False)
 
     def forward(self, x, cos_sin, kv_cache):
         B, T, C = x.size()
@@ -88,13 +90,20 @@ class CausalSelfAttention(nn.Module):
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
         
-        # RoPE++: Apply different rotations to first/second half of query heads
-        if self.use_imaginary:
+        # RoPE++: Three modes for applying rotary embeddings
+        if self.use_imaginary == "split":
+            # Split mode: Apply different rotations to first/second half of query heads
             half_heads = self.n_head // 2
             q_first_half = apply_rotary_emb(q[:, :, :half_heads, :], cos, sin)
             q_second_half = apply_rotary_emb_imaginary(q[:, :, half_heads:, :], cos, sin)
             q = torch.cat([q_first_half, q_second_half], dim=2)
-        else:
+        elif self.use_imaginary == "double":
+            # Double mode: Apply both RoPE variants to all heads and stack them
+            q_real = apply_rotary_emb(q, cos, sin)
+            q_imag = apply_rotary_emb_imaginary(q, cos, sin)
+            q = torch.cat([q_real, q_imag], dim=2)  # (B, T, 2*n_head, head_dim)
+        else:  # "none"
+            # Standard RoPE
             q = apply_rotary_emb(q, cos, sin)
         
         k = apply_rotary_emb(k, cos, sin)
@@ -103,13 +112,24 @@ class CausalSelfAttention(nn.Module):
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
 
         # Apply KV cache: insert current k,v into cache, get the full view so far
+        # Note: Cache always stores base K/V heads, repetition happens after retrieval
         if kv_cache is not None:
             k, v = kv_cache.insert_kv(self.layer_idx, k, v)
+        
+        # For double mode: repeat K/V to match doubled Q heads
+        if self.use_imaginary == "double":
+            # Double mode requires GQA to be disabled (n_head == n_kv_head)
+            assert self.n_head == self.n_kv_head, \
+                f"Double mode requires n_head == n_kv_head (GQA disabled), got n_head={self.n_head}, n_kv_head={self.n_kv_head}"
+            # Simple case: just double K and V
+            k = k.repeat(1, 2, 1, 1)  # (B, 2*n_kv_head, T, D)
+            v = v.repeat(1, 2, 1, 1)  # (B, 2*n_kv_head, T, D)
         Tq = q.size(2) # number of queries in this forward pass
         Tk = k.size(2) # number of keys/values in total (in the cache + current forward pass)
 
         # Attention: queries attend to keys/values autoregressively. A few cases to handle:
-        enable_gqa = self.n_head != self.n_kv_head # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
+        # In double mode, GQA is disabled (we've already repeated K/V manually)
+        enable_gqa = (self.n_head != self.n_kv_head) and (self.use_imaginary != "double")
         if kv_cache is None or Tq == Tk:
             # During training (no KV cache), attend as usual with causal attention
             # And even if there is KV cache, we can still use this simple version when Tq == Tk
@@ -129,8 +149,9 @@ class CausalSelfAttention(nn.Module):
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
 
         # Re-assemble the heads side by side and project back to residual stream
-        y = y.transpose(1, 2).contiguous().view(B, T, -1)
-        y = self.c_proj(y)
+        y = y.transpose(1, 2).contiguous()  # (B, T, H, D) where H might be 2*n_head in double mode
+        y = y.view(B, T, -1)  # Flatten to (B, T, n_embd) or (B, T, 2*n_embd) in double mode
+        y = self.c_proj(y)  # Project back to (B, T, n_embd)
         return y
 
 
